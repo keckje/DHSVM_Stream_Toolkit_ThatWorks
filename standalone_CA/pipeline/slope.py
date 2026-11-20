@@ -40,7 +40,11 @@ def main():
                               out_path=str(SLOPE_FILLED), verbose=True)
     print(f"  fill stats: {stats}")
 
-    # 3. Validate against qgis_CA reference.
+    # 3. Validate against qgis_CA reference (skipped when no reference exists,
+    #    e.g. on a new watershed; the comparison is diagnostic only).
+    if not REF_SLOPE.exists():
+        print(f"\n[slope] no reference at {REF_SLOPE}; skipping comparison")
+        return
     print("\n[slope] comparing against qgis_CA reference")
     ok = compare_rasters(str(SLOPE_FILLED), str(REF_SLOPE), atol=0.0)
     print("\nSLOPE MATCH (atol=0):", ok)

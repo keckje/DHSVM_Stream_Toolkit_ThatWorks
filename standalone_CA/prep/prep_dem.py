@@ -18,6 +18,11 @@
 # target grid, so the reprojection interpolates and mildly smooths the surface,
 # which is acceptable for routing.
 #
+# Exception: with --align-to-source (env DHSVM_DEM_ALIGN_SOURCE=1), when the
+# source DEM is already in the target CRS at the target resolution, the grid is
+# snapped to the source's own cells and resampling is NEAREST, so output cells
+# are exact copies of source cells (cut to the basin and masked, no smoothing).
+#
 # Masking to the watershed is required: the hydrology stage routes the whole
 # raster, so an unmasked rectangle would pull in neighbouring drainage and give
 # the wrong contributing area.
@@ -56,32 +61,65 @@ PAD_CELLS = 0         # cells of margin around the basin bbox; 0 = tight, like C
 NODATA = -9999.0
 
 
-def target_grid(watershed_utm, res, pad_cells=PAD_CELLS):
+def target_grid(watershed_utm, res, pad_cells=PAD_CELLS, origin=(0.0, 0.0)):
     """Target-CRS grid over the watershed bounds plus a small pad, snapped so
-    cell edges fall on multiples of res. pad_cells is a margin in whole cells,
-    so the same margin holds across resolutions (a fixed metre pad would be a
-    different number of cells at 10 m vs 30 m)."""
+    cell edges fall on origin + k*res (origin (0, 0) = multiples of res; pass the
+    source DEM's corner to land on the source cells). pad_cells is a margin in
+    whole cells, so the same margin holds across resolutions (a fixed metre pad
+    would be a different number of cells at 10 m vs 30 m)."""
     pad_m = pad_cells * res
+    ox, oy = origin
     minx, miny, maxx, maxy = watershed_utm.total_bounds
-    minx = math.floor((minx - pad_m) / res) * res
-    miny = math.floor((miny - pad_m) / res) * res
-    maxx = math.ceil((maxx + pad_m) / res) * res
-    maxy = math.ceil((maxy + pad_m) / res) * res
+    minx = ox + math.floor((minx - pad_m - ox) / res) * res
+    miny = oy + math.floor((miny - pad_m - oy) / res) * res
+    maxx = ox + math.ceil((maxx + pad_m - ox) / res) * res
+    maxy = oy + math.ceil((maxy + pad_m - oy) / res) * res
     width = int(round((maxx - minx) / res))
     height = int(round((maxy - miny) / res))
     transform = from_origin(minx, maxy, res, res)
     return transform, width, height, (minx, miny, maxx, maxy)
 
 
-def prep_dem(src_path, out_path, watershed_path, res, epsg, pad_cells=PAD_CELLS):
+def source_origin_for_alignment(src, epsg, res):
+    """Grid origin that puts target cells exactly on the source cells. Only
+    possible when the source is already in the target CRS at the target
+    resolution with north-up square cells; otherwise raise, since an aligned
+    grid cannot exist and silently falling back would hide the resampling."""
+    if src.crs is None or src.crs.to_epsg() != epsg:
+        raise SystemExit("align-to-source: source CRS %s is not EPSG:%d; "
+                         "set DHSVM_EPSG to the source's EPSG or turn alignment off"
+                         % (src.crs, epsg))
+    t = src.transform
+    if t.b != 0 or t.d != 0 or not (math.isclose(t.a, res) and math.isclose(-t.e, res)):
+        raise SystemExit("align-to-source: source cells are %s x %s (rotation %s, %s), "
+                         "target res is %s; alignment needs north-up %s m cells"
+                         % (t.a, -t.e, t.b, t.d, res, res))
+    return t.c, t.f
+
+
+def prep_dem(src_path, out_path, watershed_path, res, epsg, pad_cells=PAD_CELLS,
+             align_to_source=False):
     """Reproject src_path to EPSG:epsg on a clean res-metre grid and mask it to
-    the watershed polygon. Write out_path. Return (valid_cells, total_cells)."""
+    the watershed polygon. Write out_path. Return (valid_cells, total_cells).
+
+    align_to_source: snap the target grid to the source DEM's own cells instead
+    of to multiples of res. Requires the source to already be in EPSG:epsg at
+    res; the output cells are then exact copies of source cells (nearest, no
+    interpolation), cut to the basin and masked."""
     dst_crs = "EPSG:%d" % epsg
     wsf = gpd.read_file(watershed_path).to_crs(dst_crs)
-    transform, width, height, bounds = target_grid(wsf, res, pad_cells)
+    origin = (0.0, 0.0)
+    if align_to_source:
+        with rasterio.open(src_path) as src:
+            origin = source_origin_for_alignment(src, epsg, res)
+    transform, width, height, bounds = target_grid(wsf, res, pad_cells, origin)
+    resampling = Resampling.nearest if align_to_source else Resampling.bilinear
     print("target: %s  %.3f m  %d rows x %d cols  (pad %d cells)"
           % (dst_crs, res, height, width, pad_cells))
-    print("extent (%s): %s" % (dst_crs, tuple(round(b, 1) for b in bounds)))
+    print("extent (%s): %s" % (dst_crs, tuple(round(b, 3) for b in bounds)))
+    print("grid: %s  resampling: %s"
+          % ("aligned to source cells" if align_to_source else "snapped to multiples of res",
+             resampling.name))
 
     dst = np.full((height, width), NODATA, dtype="float32")
     with rasterio.open(src_path) as src:
@@ -97,7 +135,7 @@ def prep_dem(src_path, out_path, watershed_path, res, epsg, pad_cells=PAD_CELLS)
             dst_transform=transform,
             dst_crs=dst_crs,
             dst_nodata=NODATA,
-            resampling=Resampling.bilinear,
+            resampling=resampling,
         )
 
     # mask to the watershed polygon: True outside the polygon -> nodata
@@ -142,10 +180,15 @@ def main():
                     help="margin in whole cells around the basin bbox "
                          "(default %d = tight, like CA; env DHSVM_DEM_PAD_CELLS)"
                          % PAD_CELLS)
+    ap.add_argument("--align-to-source", action="store_true",
+                    default=os.environ.get("DHSVM_DEM_ALIGN_SOURCE", "0") == "1",
+                    help="snap the output grid to the source DEM's cells (no "
+                         "interpolation); source must already be in --epsg at --res "
+                         "(env DHSVM_DEM_ALIGN_SOURCE=1)")
     args = ap.parse_args()
 
     prep_dem(args.src_dem, args.out_dem, args.watershed, args.res, args.epsg,
-             args.pad_cells)
+             args.pad_cells, args.align_to_source)
 
 
 if __name__ == "__main__":
